@@ -1,10 +1,11 @@
 # IMAP Email MCP Server
 
-A Model Context Protocol (MCP) server that enables AI assistants to fetch, summarize, and send emails via IMAP/SMTP. This server exposes two main tools through the MCP protocol for use with OpenAI's Responses API.
+A Model Context Protocol (MCP) server that enables AI assistants to fetch, read, summarize, and send emails via IMAP/SMTP. This server exposes three main tools through the MCP protocol for use with OpenAI's Responses API.
 
 ## Features
 
 - Fetch emails from IMAP servers within specified time ranges
+- Read full email content without AI processing
 - AI-powered email summarization using GPT-4o-mini with focus on key points, senders, and action items
 - Send emails via SMTP with support for CC, BCC, and HTML content
 - MCP protocol over HTTP with SSE support
@@ -144,7 +145,7 @@ Your MCP server is now accessible at `https://yourdomain.ngrok.dev/sse`
 
 ### MCP Tools
 
-The server exposes two tools via the MCP protocol:
+The server exposes three tools via the MCP protocol:
 
 #### 1. summarize_emails
 
@@ -171,7 +172,32 @@ Returns a summary of all emails within the time range, including:
 - AI-generated summary of email content
 - Individual email details (from, subject, date, preview)
 
-#### 2. send_email
+#### 2. read_emails
+
+Fetches and returns full email content from a specified time range without AI summarization.
+
+**Input Schema:**
+```json
+{
+  "start_iso": "2024-11-25T00:00:00Z",
+  "end_iso": "2024-11-25T23:59:59Z"
+}
+```
+
+**Example Use Case:**
+"Read all emails from this morning" or "Show me the full content of emails received yesterday"
+
+**Parameters:**
+- `start_iso` (required): Start time in ISO 8601 format with Z suffix
+- `end_iso` (required): End time in ISO 8601 format with Z suffix
+
+**Response:**
+Returns the complete email data within the time range, including:
+- Number of emails found
+- Individual email details (from, subject, date, body preview)
+- No AI summarization - raw email data only
+
+#### 3. send_email
 
 Sends an email to one or more recipients.
 

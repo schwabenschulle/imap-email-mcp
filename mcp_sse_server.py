@@ -197,6 +197,25 @@ def summarize_emails(start_iso: str, end_iso: str) -> Dict[str, Any]:
         }
 
 
+def read_emails(start_iso: str, end_iso: str) -> Dict[str, Any]:
+    """Read and return full email content without AI summarization."""
+    try:
+        emails = fetch_emails_from_imap(start_iso, end_iso)
+        
+        return {
+            "time_range": {"start": start_iso, "end": end_iso},
+            "email_count": len(emails),
+            "emails": emails
+        }
+    except Exception as e:
+        return {
+            "error": str(e),
+            "time_range": {"start": start_iso, "end": end_iso},
+            "email_count": 0,
+            "emails": []
+        }
+
+
 def send_email(
     to: List[str],
     subject: str,
@@ -350,6 +369,26 @@ async def mcp_sse_endpoint(request: Request):
                             }
                         },
                         {
+                            "name": "read_emails",
+                            "description": "Fetch and return full email content from a specified time range without AI summarization. Use this when the user wants to see the complete emails. Always provide ISO 8601 timestamps in UTC with Z suffix.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "start_iso": {
+                                        "type": "string",
+                                        "format": "date-time",
+                                        "description": "Start time in ISO 8601 format with Z suffix (e.g., '2024-06-05T00:00:00Z')"
+                                    },
+                                    "end_iso": {
+                                        "type": "string",
+                                        "format": "date-time",
+                                        "description": "End time in ISO 8601 format with Z suffix (e.g., '2024-06-05T23:59:59Z')"
+                                    }
+                                },
+                                "required": ["start_iso", "end_iso"]
+                            }
+                        },
+                        {
                             "name": "send_email",
                             "description": "Send an email to one or more recipients. Use this when the user wants to compose and send an email. Supports plain text or HTML content, CC and BCC recipients.",
                             "inputSchema": {
@@ -402,6 +441,26 @@ async def mcp_sse_endpoint(request: Request):
                 end_iso = arguments.get("end_iso")
                 
                 result = summarize_emails(start_iso, end_iso)
+                
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": json.dumps(result, indent=2)
+                            }
+                        ]
+                    }
+                }
+                return JSONResponse(content=response)
+            
+            elif tool_name == "read_emails":
+                start_iso = arguments.get("start_iso")
+                end_iso = arguments.get("end_iso")
+                
+                result = read_emails(start_iso, end_iso)
                 
                 response = {
                     "jsonrpc": "2.0",
