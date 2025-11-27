@@ -103,7 +103,20 @@ EMAIL_FROM_NAME=Your Name
 # Server Configuration
 FLASK_PORT=5001
 FLASK_HOST=0.0.0.0
+
+# Authentication (optional but recommended)
+MCP_API_KEY=your_generated_api_key_here
 ```
+
+**Generating an API Key:**
+
+For security, generate a secure API key:
+
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+Add the generated key to your `.env` file as `MCP_API_KEY`.
 
 ### Step 5: Install ngrok (for remote access)
 
@@ -272,6 +285,51 @@ Returns a JSON object containing:
 
 This approach ensures you get both a quick overview (AI summary) and detailed information (individual emails) for deeper analysis if needed.
 
+## Authentication
+
+The server supports **Bearer token authentication** to secure your MCP endpoints.
+
+### Setup Authentication
+
+1. **Generate a secure API key:**
+   ```bash
+   python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+   ```
+
+2. **Add to `.env` file:**
+   ```bash
+   MCP_API_KEY=your_generated_api_key_here
+   ```
+
+3. **Restart the server:**
+   ```bash
+   ./start_server.sh
+   ```
+
+   You should see: `🔒 Authentication: ENABLED`
+
+### Using Authentication
+
+**With OpenAI Builder:**
+- Set authentication method to: **"Access Token/API key"**
+- Paste your `MCP_API_KEY` value in the API key field
+
+**With curl:**
+```bash
+# Without auth (will fail if MCP_API_KEY is set)
+curl https://yourdomain.ngrok.dev/sse
+
+# With auth (will succeed)
+curl -H "Authorization: Bearer YOUR_API_KEY" https://yourdomain.ngrok.dev/sse
+```
+
+**Security Notes:**
+- ✅ Use Bearer token authentication for production
+- 🔒 Keep your `MCP_API_KEY` secret
+- 🔄 Rotate the key periodically
+- 📝 Never commit `.env` to git
+- ⚠️ If `MCP_API_KEY` is not set, authentication is disabled (for development only)
+
 ## OpenAI Integration
 
 To use this MCP server with OpenAI's Responses API:
@@ -282,7 +340,11 @@ To use this MCP server with OpenAI's Responses API:
 ```json
 {
   "type": "mcp",
-  "url": "https://yourdomain.ngrok.dev/sse"
+  "url": "https://yourdomain.ngrok.dev/sse",
+  "auth": {
+    "type": "bearer",
+    "token": "your_mcp_api_key"
+  }
 }
 ```
 
@@ -314,6 +376,12 @@ To use this MCP server with OpenAI's Responses API:
 
 **OpenAI summarization fails:**
 - Verify your OpenAI API key is valid and has credits
+
+**Authentication errors (401 Unauthorized):**
+- Verify `MCP_API_KEY` is set in your `.env` file
+- Check that the Authorization header includes `Bearer` prefix
+- Ensure the API key matches exactly (no extra spaces or quotes)
+- Restart the server after updating `.env` file
 - Check the API key has access to the required models
 
 ## Security Notes

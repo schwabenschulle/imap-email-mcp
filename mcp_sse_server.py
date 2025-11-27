@@ -18,7 +18,7 @@ from email.mime.multipart import MIMEMultipart
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from openai import OpenAI
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
@@ -37,6 +37,9 @@ IMAP_USER = os.getenv("IMAP_USER")
 IMAP_PASS = os.getenv("IMAP_PASS")
 EMAIL_FROM_NAME = os.getenv("EMAIL_FROM_NAME", "Frank Schulze")
 
+# Authentication configuration
+MCP_API_KEY = os.getenv("MCP_API_KEY")
+
 if not IMAP_USER or not IMAP_PASS:
     print("[ERROR] Missing IMAP_USER or IMAP_PASS in .env file", file=sys.stderr)
     sys.exit(1)
@@ -44,6 +47,11 @@ if not IMAP_USER or not IMAP_PASS:
 if not os.getenv("OPENAI_API_KEY"):
     print("[ERROR] Missing OPENAI_API_KEY in .env file", file=sys.stderr)
     sys.exit(1)
+
+if MCP_API_KEY:
+    print("[INFO] MCP API Key authentication enabled", flush=True)
+else:
+    print("[WARNING] MCP_API_KEY not set - authentication disabled", flush=True)
 
 # Create FastAPI app
 app = FastAPI(title="Email Summarizer MCP Server", version="1.0.0")
@@ -56,6 +64,25 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def verify_api_key(request: Request) -> bool:
+    """Verify API key from Authorization header"""
+    if not MCP_API_KEY:
+        # If no API key is configured, allow all requests
+        return True
+    
+    auth_header = request.headers.get("Authorization", "")
+    
+    # Support both "Bearer <token>" and raw token
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+    elif auth_header.startswith("bearer "):
+        token = auth_header[7:]
+    else:
+        token = auth_header
+    
+    return token == MCP_API_KEY
 
 
 def fetch_emails_from_imap(start_iso: str, end_iso: str) -> list:
@@ -304,6 +331,20 @@ async def root():
 @app.post("/sse")
 async def mcp_sse_endpoint(request: Request):
     """MCP SSE endpoint for OpenAI Responses API"""
+    # Verify API key authentication
+    if not verify_api_key(request):
+        print("[AUTH FAILED] Invalid or missing API key", flush=True)
+        return JSONResponse(
+            status_code=401,
+            content={
+                "jsonrpc": "2.0",
+                "error": {
+                    "code": -32001,
+                    "message": "Unauthorized: Invalid or missing API key"
+                }
+            }
+        )
+    
     # Handle GET request (SSE connection info)
     if request.method == "GET":
         return {
@@ -603,6 +644,13 @@ async def get_openapi_schema(request: Request):
 @app.post("/tool/summarize_emails")
 async def summarize_emails_rest(request: Request):
     """REST endpoint for testing"""
+    # Verify API key authentication
+    if not verify_api_key(request):
+        return JSONResponse(
+            status_code=401,
+            content={"error": "Unauthorized: Invalid or missing API key"}
+        )
+    
     try:
         data = await request.json()
         start_iso = data.get("start_iso")
@@ -635,9 +683,18 @@ if __name__ == "__main__":
     print("   REST Test: http://0.0.0.0:5001/tool/summarize_emails")
     print("=" * 60)
     print("")
+    if MCP_API_KEY:
+        print("🔒 Authentication: ENABLED")
+        print("   Use 'Authorization: Bearer <YOUR_API_KEY>' header")
+    else:
+        print("⚠️  Authentication: DISABLED (set MCP_API_KEY in .env)")
+    print("")
     print("For OpenAI Responses API:")
     print('  server_url: "https://frankimap.ngrok.dev/sse"')
     print('  server_label: "email_summarizer"')
+    if MCP_API_KEY:
+        print('  auth_method: "Access Token/API key"')
+        print('  api_key: <YOUR_MCP_API_KEY>')
     print("")
     
     uvicorn.run(app, host="0.0.0.0", port=5001)
