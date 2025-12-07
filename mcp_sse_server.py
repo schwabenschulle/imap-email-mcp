@@ -5,6 +5,7 @@ FastMCP Email Server with proper SSE support for OpenAI Responses API
 import os
 import sys
 import json
+import re
 import asyncio
 from datetime import datetime
 from typing import Dict, Any, List, Optional
@@ -22,6 +23,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
+from bs4 import BeautifulSoup
 
 # Load environment variables
 load_dotenv()
@@ -85,25 +87,60 @@ def verify_api_key(request: Request) -> bool:
     return token == MCP_API_KEY
 
 
-def fetch_emails_from_imap(start_iso: str, end_iso: str) -> list:
-    """Fetch emails from IMAP server within the specified time range."""
+def fetch_emails_from_imap(start_iso: str, end_iso: str, sender_filter: Optional[str] = None, max_emails: int = 50) -> list:
+    """Fetch emails from IMAP server within the specified time range.
+    
+    Args:
+        start_iso: Start time in ISO format
+        end_iso: End time in ISO format
+        sender_filter: Optional email address or domain to filter by (e.g., 'service.paypal.com')
+        max_emails: Maximum number of emails to fetch (default: 50)
+    """
+    mail = None
     try:
         start_dt = datetime.fromisoformat(start_iso.replace('Z', '+00:00'))
         end_dt = datetime.fromisoformat(end_iso.replace('Z', '+00:00'))
         
+        print(f"[INFO] Connecting to IMAP server: {IMAP_HOST}:993", flush=True)
         ssl_context = ssl.create_default_context()
         mail = imaplib.IMAP4_SSL(IMAP_HOST, 993, ssl_context=ssl_context)
-        mail.login(IMAP_USER, IMAP_PASS)
-        mail.select("INBOX")
+        
+        # Login
+        print(f"[INFO] Logging in as: {IMAP_USER}", flush=True)
+        status, response = mail.login(IMAP_USER, IMAP_PASS)
+        if status != "OK":
+            raise Exception(f"IMAP login failed: {response}")
+        print(f"[INFO] IMAP login successful", flush=True)
+        
+        # Select mailbox
+        print(f"[INFO] Selecting INBOX...", flush=True)
+        status, response = mail.select("INBOX")
+        if status != "OK":
+            raise Exception(f"IMAP select INBOX failed: {response}")
+        print(f"[INFO] INBOX selected, {response[0].decode()} messages", flush=True)
         
         search_date = start_dt.strftime("%d-%b-%Y")
-        status, messages = mail.search(None, f'(SINCE "{search_date}")')
+        
+        # Build search criteria
+        if sender_filter:
+            search_criteria = f'(SINCE "{search_date}" FROM "{sender_filter}")'
+        else:
+            search_criteria = f'(SINCE "{search_date}")'
+        
+        print(f"[INFO] Searching with criteria: {search_criteria}", flush=True)
+        status, messages = mail.search(None, search_criteria)
         
         if status != "OK":
+            print(f"[ERROR] IMAP search failed: status={status}, messages={messages}", file=sys.stderr, flush=True)
             return []
+        
+        print(f"[INFO] Search successful, found {len(messages[0].split())} messages", flush=True)
         
         email_ids = messages[0].split()
         emails = []
+        
+        # Limit the number of emails to process
+        email_ids = email_ids[-max_emails:] if len(email_ids) > max_emails else email_ids
         
         for email_id in email_ids:
             status, msg_data = mail.fetch(email_id, "(RFC822)")
@@ -131,20 +168,68 @@ def fetch_emails_from_imap(start_iso: str, end_iso: str) -> list:
                 
                 from_header = msg.get("From", "")
                 
-                body_preview = ""
+                # Extract FULL email body - PayPal details can be deep in the email
+                body_plain = ""
+                body_html_raw = ""
+                body_html_parsed = ""
+                
                 if msg.is_multipart():
                     for part in msg.walk():
-                        if part.get_content_type() == "text/plain":
+                        content_type = part.get_content_type()
+                        
+                        # Get plain text version (FULL, not truncated)
+                        if content_type == "text/plain" and not body_plain:
                             try:
-                                body_preview = part.get_payload(decode=True).decode("utf-8", errors="ignore")[:200]
-                                break
+                                body_plain = part.get_payload(decode=True).decode("utf-8", errors="ignore")
+                            except:
+                                pass
+                        
+                        # Get HTML version (FULL, not truncated)
+                        elif content_type == "text/html" and not body_html_raw:
+                            try:
+                                body_html_raw = part.get_payload(decode=True).decode("utf-8", errors="ignore")
                             except:
                                 pass
                 else:
                     try:
-                        body_preview = msg.get_payload(decode=True).decode("utf-8", errors="ignore")[:200]
+                        payload = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
+                        if msg.get_content_type() == "text/plain":
+                            body_plain = payload
+                        else:
+                            body_html_raw = payload
                     except:
                         pass
+                
+                # Parse HTML to readable text if we have HTML
+                if body_html_raw:
+                    try:
+                        soup = BeautifulSoup(body_html_raw, 'lxml')
+                        
+                        # Remove script, style, and meta elements
+                        for element in soup(["script", "style", "meta", "link"]):
+                            element.decompose()
+                        
+                        # Get text and clean it up
+                        text = soup.get_text(separator=' ', strip=True)
+                        
+                        # Clean up whitespace
+                        lines = (line.strip() for line in text.splitlines())
+                        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+                        body_html_parsed = ' '.join(chunk for chunk in chunks if chunk)
+                        
+                        print(f"[INFO] Parsed HTML: {len(body_html_parsed)} chars from {len(body_html_raw)} HTML chars", flush=True)
+                    except Exception as e:
+                        print(f"[WARNING] BeautifulSoup parsing failed: {e}", flush=True)
+                        # Fallback to simple regex
+                        body_html_parsed = re.sub(r'<[^>]+>', ' ', body_html_raw)
+                        body_html_parsed = re.sub(r'\s+', ' ', body_html_parsed).strip()
+                
+                # Use the best available content, but limit to 10000 chars for API
+                body_preview = body_plain or body_html_parsed or ""
+                body_preview = body_preview[:10000]  # Increased from 3000 to 10000!
+                
+                if not body_preview:
+                    print(f"[WARNING] No body content extracted for email: {subject}", flush=True)
                 
                 emails.append({
                     "from": from_header,
@@ -159,12 +244,19 @@ def fetch_emails_from_imap(start_iso: str, end_iso: str) -> list:
                 print(f"[WARNING] Error parsing email: {e}", file=sys.stderr)
                 continue
         
+        print(f"[INFO] Closing IMAP connection", flush=True)
         mail.close()
         mail.logout()
         return emails
     
     except Exception as e:
-        print(f"[ERROR] IMAP error: {e}", file=sys.stderr)
+        print(f"[ERROR] IMAP error: {e}", file=sys.stderr, flush=True)
+        # Attempt to cleanup connection
+        if mail:
+            try:
+                mail.logout()
+            except:
+                pass
         raise
 
 
@@ -180,19 +272,47 @@ def generate_summary(emails: list) -> str:
         ])
         
         response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5.1",  # Using GPT-5.1 as requested
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a helpful assistant that summarizes emails. Provide a concise summary of the emails below, highlighting key points, senders, and any action items."
+                    "content": """You are an expert data extraction specialist for emails, particularly payment notifications.
+
+CRITICAL: You must extract EXACT information from the email body text provided. Do NOT say "N/A" unless the information is truly missing.
+
+For PayPal payment emails (subject: "Du hast eine Zahlung erhalten"):
+1. Look for the AMOUNT - patterns:
+   - "Zahlung in Höhe von 45,00 EUR"
+   - "Sie haben 120,50 € erhalten"
+   - Numbers with EUR or € symbol
+
+2. Look for PAYER NAME - patterns:
+   - "von [Name]"
+   - "from [Name]"
+   - After "Absender:" or "Sender:"
+   - Near the amount information
+
+3. Look for TRANSACTION ID - patterns:
+   - "Transaktionscode:"
+   - "Transaction ID:"
+   - Long alphanumeric codes (e.g., 1AB234567CD890123)
+
+4. Look for COMMENT/PURPOSE - patterns:
+   - "Nachricht:" or "Message:"
+   - "Verwendungszweck:"
+   - Any text after "Der Käufer hat folgende Nachricht hinterlassen:"
+
+5. Extract DATE/TIME from the email
+
+Create a detailed table with ALL extracted information for EACH email. If you find the information in the body text, include it!"""
                 },
                 {
                     "role": "user",
-                    "content": f"Please summarize these {len(emails)} emails:\n\n{email_text}"
+                    "content": f"Extract detailed payment information from these {len(emails)} emails. Each email body contains up to 2000 characters with all details:\n\n{email_text}"
                 }
             ],
-            temperature=0.7,
-            max_tokens=500
+            temperature=0.1,  # Lower for more precise extraction
+            max_tokens=4000  # More tokens for detailed output
         )
         
         return response.choices[0].message.content
@@ -202,17 +322,25 @@ def generate_summary(emails: list) -> str:
         return f"Error generating summary: {e}"
 
 
-def summarize_emails(start_iso: str, end_iso: str) -> Dict[str, Any]:
-    """Main tool function for email summarization."""
+def summarize_emails(start_iso: str, end_iso: str, sender_filter: Optional[str] = None, max_emails: int = 50) -> Dict[str, Any]:
+    """Main tool function for email summarization.
+    
+    Args:
+        start_iso: Start time in ISO format
+        end_iso: End time in ISO format
+        sender_filter: Optional email address or domain to filter by
+        max_emails: Maximum number of emails to summarize (default: 50)
+    """
     try:
-        emails = fetch_emails_from_imap(start_iso, end_iso)
+        emails = fetch_emails_from_imap(start_iso, end_iso, sender_filter, max_emails)
         summary = generate_summary(emails)
         
         return {
             "time_range": {"start": start_iso, "end": end_iso},
             "email_count": len(emails),
             "emails": emails,
-            "summary": summary
+            "summary": summary,
+            "note": f"Limited to {max_emails} most recent emails" if sender_filter else f"Limited to {max_emails} emails"
         }
     except Exception as e:
         return {
@@ -224,15 +352,23 @@ def summarize_emails(start_iso: str, end_iso: str) -> Dict[str, Any]:
         }
 
 
-def read_emails(start_iso: str, end_iso: str) -> Dict[str, Any]:
-    """Read and return full email content without AI summarization."""
+def read_emails(start_iso: str, end_iso: str, sender_filter: Optional[str] = None, max_emails: int = 50) -> Dict[str, Any]:
+    """Read and return full email content without AI summarization.
+    
+    Args:
+        start_iso: Start time in ISO format
+        end_iso: End time in ISO format  
+        sender_filter: Optional email address or domain to filter by
+        max_emails: Maximum number of emails to return (default: 50)
+    """
     try:
-        emails = fetch_emails_from_imap(start_iso, end_iso)
+        emails = fetch_emails_from_imap(start_iso, end_iso, sender_filter, max_emails)
         
         return {
             "time_range": {"start": start_iso, "end": end_iso},
             "email_count": len(emails),
-            "emails": emails
+            "emails": emails,
+            "note": f"Limited to {max_emails} most recent emails" if sender_filter else f"Limited to {max_emails} emails"
         }
     except Exception as e:
         return {
@@ -391,7 +527,7 @@ async def mcp_sse_endpoint(request: Request):
                     "tools": [
                         {
                             "name": "summarize_emails",
-                            "description": "Fetch and summarize emails from a specified time range. Use this when the user asks about emails from a specific date or time period. Always provide ISO 8601 timestamps in UTC with Z suffix.",
+                            "description": "Fetch and summarize emails from a specified time range. Use this when the user asks about emails from a specific date or time period. Always provide ISO 8601 timestamps in UTC with Z suffix. Supports filtering by sender to reduce token usage.",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
@@ -404,6 +540,15 @@ async def mcp_sse_endpoint(request: Request):
                                         "type": "string",
                                         "format": "date-time",
                                         "description": "End time in ISO 8601 format with Z suffix (e.g., '2024-06-05T23:59:59Z')"
+                                    },
+                                    "sender_filter": {
+                                        "type": "string",
+                                        "description": "Optional: Filter emails by sender email address or domain (e.g., 'service.paypal.com', 'noreply@example.com')"
+                                    },
+                                    "max_emails": {
+                                        "type": "integer",
+                                        "description": "Maximum number of emails to process (default: 50, prevents token overflow)",
+                                        "default": 50
                                     }
                                 },
                                 "required": ["start_iso", "end_iso"]
@@ -411,7 +556,7 @@ async def mcp_sse_endpoint(request: Request):
                         },
                         {
                             "name": "read_emails",
-                            "description": "Fetch and return full email content from a specified time range without AI summarization. Use this when the user wants to see the complete emails. Always provide ISO 8601 timestamps in UTC with Z suffix.",
+                            "description": "Fetch and return full email content from a specified time range without AI summarization. Use this when the user wants to see the complete emails. Always provide ISO 8601 timestamps in UTC with Z suffix. Supports filtering by sender to reduce token usage.",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
@@ -424,6 +569,15 @@ async def mcp_sse_endpoint(request: Request):
                                         "type": "string",
                                         "format": "date-time",
                                         "description": "End time in ISO 8601 format with Z suffix (e.g., '2024-06-05T23:59:59Z')"
+                                    },
+                                    "sender_filter": {
+                                        "type": "string",
+                                        "description": "Optional: Filter emails by sender email address or domain (e.g., 'service.paypal.com', 'noreply@example.com')"
+                                    },
+                                    "max_emails": {
+                                        "type": "integer",
+                                        "description": "Maximum number of emails to return (default: 50, prevents token overflow)",
+                                        "default": 50
                                     }
                                 },
                                 "required": ["start_iso", "end_iso"]
@@ -480,8 +634,10 @@ async def mcp_sse_endpoint(request: Request):
             if tool_name == "summarize_emails":
                 start_iso = arguments.get("start_iso")
                 end_iso = arguments.get("end_iso")
+                sender_filter = arguments.get("sender_filter")
+                max_emails = arguments.get("max_emails", 50)
                 
-                result = summarize_emails(start_iso, end_iso)
+                result = summarize_emails(start_iso, end_iso, sender_filter, max_emails)
                 
                 response = {
                     "jsonrpc": "2.0",
@@ -500,8 +656,10 @@ async def mcp_sse_endpoint(request: Request):
             elif tool_name == "read_emails":
                 start_iso = arguments.get("start_iso")
                 end_iso = arguments.get("end_iso")
+                sender_filter = arguments.get("sender_filter")
+                max_emails = arguments.get("max_emails", 50)
                 
-                result = read_emails(start_iso, end_iso)
+                result = read_emails(start_iso, end_iso, sender_filter, max_emails)
                 
                 response = {
                     "jsonrpc": "2.0",
@@ -519,6 +677,9 @@ async def mcp_sse_endpoint(request: Request):
             
             elif tool_name == "send_email":
                 to = arguments.get("to", [])
+                # Convert to list if it's a string
+                if isinstance(to, str):
+                    to = [to]
                 subject = arguments.get("subject", "")
                 body = arguments.get("body", "")
                 cc = arguments.get("cc")
